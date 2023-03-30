@@ -972,3 +972,152 @@ func TestPersistentVolumeLastPhaseTransitionTime(t *testing.T) {
 	_, ctx := ktesting.NewTestContext(t)
 	runTimestampTests(ctx, t, tests)
 }
+
+// TODO: remove once PersistentVolumeLastPhaseTransitionTime is GA
+type timestampEnablementTest struct {
+	timestampTest
+	featureEnabledPreTest bool
+}
+
+// TODO: remove once PersistentVolumeLastPhaseTransitionTime is GA
+func TestFeatureEnablementPersistentVolumeLastPhaseTransitionTime(t *testing.T) {
+	// [Unit test set 17] - tests for feature enablement/disablement of PersistentVolumeLastPhaseTransitionTime feature
+	tests := []timestampEnablementTest{
+		{
+			featureEnabledPreTest: false,
+			timestampTest: timestampTest{
+				name:              "17-1 - PersistentVolumeLastPhaseTransitionTime (feature off)",
+				initialVolume:     newVolume("volume17-1", "1Gi", "", "", v1.VolumeAvailable, v1.PersistentVolumeReclaimRetain, classEmpty),
+				expectedVolume:    newVolume("volume17-1", "1Gi", "uid17-1", "claim17-1", v1.VolumeBound, v1.PersistentVolumeReclaimRetain, classEmpty, volume.AnnBoundByController),
+				initialClaim:      newClaim("claim17-1", "uid17-1", "1Gi", "", v1.ClaimPending, nil),
+				expectedClaim:     newClaim("claim17-1", "uid17-1", "1Gi", "volume17-1", v1.ClaimBound, nil, volume.AnnBoundByController, volume.AnnBindCompleted),
+				postTestTimestamp: false,
+				postSyncTest:      evaluateLastPhaseTransitionTimeTest,
+			},
+		},
+		{
+			featureEnabledPreTest: true,
+			timestampTest: timestampTest{
+				name:              "17-2 - (feature on)",
+				initialVolume:     newVolume("volume17-2", "1Gi", "", "", v1.VolumeAvailable, v1.PersistentVolumeReclaimRetain, classEmpty),
+				expectedVolume:    newVolume("volume17-2", "1Gi", "uid17-2", "claim17-2", v1.VolumeBound, v1.PersistentVolumeReclaimRetain, classEmpty, volume.AnnBoundByController),
+				initialClaim:      newClaim("claim17-2", "uid17-2", "1Gi", "", v1.ClaimPending, &classEmpty),
+				expectedClaim:     newClaim("claim17-2", "uid17-2", "1Gi", "volume17-2", v1.ClaimBound, &classEmpty, volume.AnnBoundByController, volume.AnnBindCompleted),
+				postTestTimestamp: true,
+				postSyncTest:      evaluateLastPhaseTransitionTimeTest,
+			},
+		},
+		{
+			featureEnabledPreTest: false,
+			timestampTest: timestampTest{
+				name:              "17-3 - PersistentVolumeLastPhaseTransitionTime (feature off->on)",
+				initialVolume:     newVolume("volume17-3", "10Gi", "uid17-3", "claim17-3", v1.VolumeBound, v1.PersistentVolumeReclaimRetain, classEmpty, volume.AnnBoundByController),
+				expectedVolume:    newVolume("volume17-3", "10Gi", "uid17-3", "claim17-3", v1.VolumeReleased, v1.PersistentVolumeReclaimRetain, classEmpty, volume.AnnBoundByController),
+				initialClaim:      newClaim("claim17-3", "uid17-3", "1Gi", "volume17-3", v1.ClaimBound, nil, volume.AnnBoundByController, volume.AnnBindCompleted),
+				expectedClaim:     noclaim,
+				postTestTimestamp: true,
+				postSyncTest: func(t *testing.T, ctrl *PersistentVolumeController, reactor *volumeReactor, test timestampTest, currentTime metav1.Time) {
+					//Check there is no timestamp yet - feature was off
+					pv := ctrl.volumes.store.List()[0].(*v1.PersistentVolume)
+					if pv.Status.LastPhaseTransitionTime != nil {
+						t.Errorf("Expected pv %v to have LastPhaseTransitionTime set to nil but it has a value: %v", test.expectedVolume.Name, pv.Status.LastPhaseTransitionTime)
+					}
+					if pv.Status.Phase != v1.VolumeBound {
+						t.Errorf("Expected pv %v to be bound but it has phase %v", test.expectedVolume.Name, pv.Status.Phase)
+					}
+
+					// Enable feature gate mid-fly.
+					defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PersistentVolumeLastPhaseTransitionTime, true)()
+
+					// Delete claim and resync - this makes pv transition phase to Released
+					obj := ctrl.claims.List()[0]
+					claim := obj.(*v1.PersistentVolumeClaim)
+					reactor.DeleteClaimEvent(claim)
+					reactor.waitForIdle()
+
+					// wait until claim is cleared from cache, i.e., deleteClaim is called
+					err := wait.Poll(10*time.Millisecond, wait.ForeverTestTimeout, func() (bool, error) {
+						return len(ctrl.claims.ListKeys()) == 0, nil
+					})
+					if err != nil {
+						t.Errorf("Failed deleting claim: %v", err)
+					}
+
+					err = wait.Poll(1*time.Second, time.Second*30, func() (bool, error) {
+						pv, err := ctrl.volumes.findByClaim(test.initialClaim, false)
+						t.Logf("pv is now %v", pv.Status.Phase)
+						if pv.Status.Phase == v1.VolumeReleased {
+							return true, nil
+						}
+						if err != nil {
+							return false, fmt.Errorf("Failed to find volume: %v", err)
+						}
+						return false, nil
+					})
+					if err != nil {
+						t.Errorf("Timed out waiting for pv %v to change phase to Available after claim deletion: %v", pv.GetName(), err)
+					}
+
+					evaluateLastPhaseTransitionTimeTest(t, ctrl, reactor, test, currentTime)
+				},
+			},
+		},
+		{
+			featureEnabledPreTest: true,
+			timestampTest: timestampTest{
+				name:              "17-4 - PersistentVolumeLastPhaseTransitionTime (feature on->off)",
+				initialVolume:     newVolume("volume17-4", "10Gi", "uid17-4", "claim17-4", v1.VolumeBound, v1.PersistentVolumeReclaimRetain, classEmpty, volume.AnnBoundByController),
+				expectedVolume:    newVolume("volume17-4", "10Gi", "uid17-4", "claim17-4", v1.VolumeReleased, v1.PersistentVolumeReclaimRetain, classEmpty, volume.AnnBoundByController),
+				initialClaim:      newClaim("claim17-4", "uid17-4", "1Gi", "volume17-4", v1.ClaimBound, nil, volume.AnnBoundByController, volume.AnnBindCompleted),
+				expectedClaim:     noclaim,
+				postTestTimestamp: false,
+				postSyncTest: func(t *testing.T, ctrl *PersistentVolumeController, reactor *volumeReactor, test timestampTest, currentTime metav1.Time) {
+					//Check there is no timestamp yet - feature was off
+					pv := ctrl.volumes.store.List()[0].(*v1.PersistentVolume)
+					if pv.Status.LastPhaseTransitionTime != nil {
+						t.Errorf("Expected pv %v to have LastPhaseTransitionTime set to nil but it has a value: %v", test.expectedVolume.Name, pv.Status.LastPhaseTransitionTime)
+					}
+					if pv.Status.Phase != v1.VolumeBound {
+						t.Errorf("Expected pv %v to be bound but it has phase %v", test.expectedVolume.Name, pv.Status.Phase)
+					}
+
+					// Disable feature gate mid-fly.
+					defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PersistentVolumeLastPhaseTransitionTime, false)()
+
+					// Delete claim and resync - this makes pv transition phase to Released
+					obj := ctrl.claims.List()[0]
+					claim := obj.(*v1.PersistentVolumeClaim)
+					reactor.DeleteClaimEvent(claim)
+					reactor.waitForIdle()
+
+					// wait until claim is cleared from cache, i.e., deleteClaim is called
+					err := wait.Poll(10*time.Millisecond, wait.ForeverTestTimeout, func() (bool, error) {
+						return len(ctrl.claims.ListKeys()) == 0, nil
+					})
+					if err != nil {
+						t.Errorf("Failed deleting claim: %v", err)
+					}
+
+					err = wait.Poll(1*time.Second, time.Second*30, func() (bool, error) {
+						pv, err := ctrl.volumes.findByClaim(test.initialClaim, false)
+						t.Logf("pv is now %v", pv.Status.Phase)
+						if pv.Status.Phase == v1.VolumeReleased {
+							return true, nil
+						}
+						if err != nil {
+							return false, fmt.Errorf("Failed to find volume: %v", err)
+						}
+						return false, nil
+					})
+					if err != nil {
+						t.Errorf("Timed out waiting for pv %v to change phase to Available after claim deletion: %v", pv.GetName(), err)
+					}
+
+					evaluateLastPhaseTransitionTimeTest(t, ctrl, reactor, test, currentTime)
+				},
+			},
+		},
+	}
+	_, ctx := ktesting.NewTestContext(t)
+	runTimestampEnablementTests(ctx, t, tests)
+}

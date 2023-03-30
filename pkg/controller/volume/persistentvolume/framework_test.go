@@ -19,7 +19,10 @@ package persistentvolume
 import (
 	"context"
 	"fmt"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	core "k8s.io/client-go/testing"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/kubernetes/pkg/features"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -925,6 +928,17 @@ func runTimestampTests(ctx context.Context, t *testing.T, tests []timestampTest)
 		test := test
 		t.Run(test.name, func(t *testing.T) {
 			doTimestampTest(ctx, t, test)
+		})
+	}
+}
+
+// TODO: remove once PersistentVolumeLastPhaseTransitionTime is GA
+func runTimestampEnablementTests(ctx context.Context, t *testing.T, tests []timestampEnablementTest) {
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PersistentVolumeLastPhaseTransitionTime, test.featureEnabledPreTest)()
+			doTimestampTest(ctx, t, test.timestampTest)
 		})
 	}
 }
