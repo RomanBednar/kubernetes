@@ -19,6 +19,7 @@ package persistentvolume
 import (
 	"context"
 	"fmt"
+	core "k8s.io/client-go/testing"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -109,6 +110,7 @@ const mockPluginName = "kubernetes.io/mock-volume"
 
 var novolumes []*v1.PersistentVolume
 var noclaims []*v1.PersistentVolumeClaim
+var noclaim *v1.PersistentVolumeClaim
 var noevents = []string{}
 var noerrors = []pvtesting.ReactorError{}
 
@@ -916,6 +918,76 @@ func runMultisyncTests(t *testing.T, ctx context.Context, tests []controllerTest
 			run(t, test)
 		})
 	}
+}
+
+func runTimestampTests(ctx context.Context, t *testing.T, tests []timestampTest) {
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			doTimestampTest(ctx, t, test)
+		})
+	}
+}
+
+func doTimestampTest(ctx context.Context, t *testing.T, test timestampTest) {
+	logger := klog.FromContext(ctx)
+	// Initialize the controller
+	client := &fake.Clientset{}
+
+	fakeVolumeWatch := watch.NewFake()
+	client.PrependWatchReactor("persistentvolumes", core.DefaultWatchReactor(fakeVolumeWatch, nil))
+	fakeClaimWatch := watch.NewFake()
+	client.PrependWatchReactor("persistentvolumeclaims", core.DefaultWatchReactor(fakeClaimWatch, nil))
+	client.PrependWatchReactor("storageclasses", core.DefaultWatchReactor(watch.NewFake(), nil))
+	client.PrependWatchReactor("nodes", core.DefaultWatchReactor(watch.NewFake(), nil))
+	client.PrependWatchReactor("pods", core.DefaultWatchReactor(watch.NewFake(), nil))
+
+	ctx, cancel := context.WithCancel(context.TODO())
+
+	informers := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
+	ctrl, err := newTestController(ctx, client, informers, true)
+	if err != nil {
+		t.Fatalf("Test %q construct persistent volume failed: %v", test.name, err)
+	}
+
+	reactor := newVolumeReactor(ctx, client, ctrl, fakeVolumeWatch, fakeClaimWatch, nil)
+	claim := test.initialClaim.DeepCopy()
+	reactor.AddClaim(claim)
+	go func(claim *v1.PersistentVolumeClaim) {
+		fakeClaimWatch.Add(claim)
+	}(claim)
+
+	volume := test.initialVolume.DeepCopy()
+	reactor.AddVolume(volume)
+	go func(volume *v1.PersistentVolume) {
+		fakeVolumeWatch.Add(volume)
+	}(volume)
+
+	currentTime := metav1.Now()
+
+	// Start the controller
+	informers.Start(ctx.Done())
+	informers.WaitForCacheSync(ctx.Done())
+	go ctrl.Run(ctx)
+
+	// Wait for the controller to pass initial sync and fill its caches.
+	err = wait.Poll(10*time.Millisecond, wait.ForeverTestTimeout, func() (bool, error) {
+		return len(ctrl.claims.ListKeys()) >= 1 &&
+			len(ctrl.volumes.store.ListKeys()) >= 1, nil
+	})
+	if err != nil {
+		t.Errorf("Test %q controller sync failed: %v", test.name, err)
+	}
+
+	logger.V(4).Info("controller synced, starting test")
+
+	ctrl.resync(ctx)
+	reactor.waitForIdle()
+
+	// Call post sync test
+	test.postSyncTest(t, ctrl, reactor, test, currentTime)
+
+	cancel()
 }
 
 // Dummy volume plugin for provisioning, deletion and recycling. It contains

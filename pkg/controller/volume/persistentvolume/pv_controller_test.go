@@ -19,6 +19,7 @@ package persistentvolume
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -885,4 +886,89 @@ func TestRetroactiveStorageClassAssignment(t *testing.T) {
 	for _, test := range tests {
 		runSyncTests(t, ctx, test.tests, test.storageClasses, nil)
 	}
+}
+
+type timestampTest struct {
+	name              string
+	initialVolume     *v1.PersistentVolume
+	expectedVolume    *v1.PersistentVolume
+	initialClaim      *v1.PersistentVolumeClaim
+	expectedClaim     *v1.PersistentVolumeClaim
+	postSyncTest      timestampTestCall
+	postTestTimestamp bool
+}
+
+type timestampTestCall func(t *testing.T, ctrl *PersistentVolumeController, reactor *volumeReactor, test timestampTest, currentTime metav1.Time)
+
+func evaluateLastPhaseTransitionTimeTest(t *testing.T, ctrl *PersistentVolumeController, volumeReactor *volumeReactor, test timestampTest, currentTime metav1.Time) {
+	if test.expectedClaim != nil {
+		if err := volumeReactor.CheckClaims([]*v1.PersistentVolumeClaim{test.expectedClaim}); err != nil {
+			t.Errorf("Test %q: %v", test.name, err)
+		}
+	}
+
+	pvs := volumeReactor.GetVolumes()
+	pv, ok := pvs[test.expectedVolume.GetName()]
+	if !ok || pv == nil {
+		t.Errorf("Failed to find pv %v in reactor", test.expectedVolume.Name)
+	}
+
+	if pv.Status.Phase != test.expectedVolume.Status.Phase {
+		t.Errorf("Expected pv %v to be in phase %v but instead it has phase %v", pv.Name, test.expectedVolume.Status.Phase, pv.Status.Phase)
+	}
+	if pv.Status.LastPhaseTransitionTime == nil && test.postTestTimestamp {
+		t.Errorf("Expected pv %v to have LastPhaseTransitionTime set but it is nil.", test.expectedVolume.Name)
+	}
+	if pv.Status.LastPhaseTransitionTime != nil && !test.postTestTimestamp {
+		t.Errorf("Expected pv %v to have LastPhaseTransitionTime set to nil but it has a value: %v", test.expectedVolume.Name, pv.Status.LastPhaseTransitionTime)
+	}
+	if pv.Status.LastPhaseTransitionTime.Before(&currentTime) {
+		t.Errorf("LastPhaseTransitionTime of pv %v was updated to timestamp which is before current time, "+
+			"this should never happen and validation should have failed.\nCurrent time: %v\nLastPhaseTransitionTime: %v", test.expectedVolume.Name, currentTime, pv.Status.LastPhaseTransitionTime)
+	}
+	return
+}
+
+func TestPersistentVolumeLastPhaseTransitionTime(t *testing.T) {
+	// Enable PersistentVolumeLastPhaseTransitionTime feature gate.
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PersistentVolumeLastPhaseTransitionTime, true)()
+
+	// [Unit test set 16] - tests for LastPhaseTransitionTime field of persistent volumes
+	tests := []timestampTest{
+		{
+			name:              "16-1 - pv binds and gets phase transition timestamp successfully",
+			initialVolume:     newVolume("volume16-1", "1Gi", "", "", v1.VolumeAvailable, v1.PersistentVolumeReclaimRetain, classEmpty),
+			expectedVolume:    newVolume("volume16-1", "1Gi", "uid16-1", "claim16-1", v1.VolumeBound, v1.PersistentVolumeReclaimRetain, classEmpty, volume.AnnBoundByController),
+			initialClaim:      newClaim("claim16-1", "uid16-1", "1Gi", "", v1.ClaimPending, nil),
+			expectedClaim:     newClaim("claim16-1", "uid16-1", "1Gi", "volume16-1", v1.ClaimBound, nil, volume.AnnBoundByController, volume.AnnBindCompleted),
+			postTestTimestamp: true,
+			postSyncTest:      evaluateLastPhaseTransitionTimeTest,
+		},
+		{
+			name:              "16-2 - pv does not bind phase transition timestamp must remain unset",
+			initialVolume:     newVolume("volume16-2", "1Gi", "", "", v1.VolumeAvailable, v1.PersistentVolumeReclaimRetain, classGold),
+			expectedVolume:    newVolume("volume16-2", "1Gi", "", "", v1.VolumeAvailable, v1.PersistentVolumeReclaimRetain, classGold),
+			initialClaim:      newClaim("claim16-2", "uid16-2", "1Gi", "", v1.ClaimPending, &classSilver),
+			expectedClaim:     newClaim("claim16-2", "uid16-2", "1Gi", "", v1.ClaimPending, &classSilver),
+			postTestTimestamp: false,
+			postSyncTest:      evaluateLastPhaseTransitionTimeTest,
+		},
+		{
+			name:              "16-3 - pv is released and gets phase transition timestamp successfully",
+			initialVolume:     newVolume("volume16-3", "10Gi", "uid16-3", "claim16-3", v1.VolumeBound, v1.PersistentVolumeReclaimRetain, classEmpty, volume.AnnBoundByController),
+			expectedVolume:    newVolume("volume16-3", "10Gi", "uid16-3", "claim16-3", v1.VolumeReleased, v1.PersistentVolumeReclaimRetain, classEmpty, volume.AnnBoundByController),
+			initialClaim:      newClaim("claim16-3", "uid16-3", "1Gi", "volume16-3", v1.ClaimBound, nil, volume.AnnBoundByController, volume.AnnBindCompleted),
+			expectedClaim:     noclaim,
+			postTestTimestamp: true,
+			postSyncTest: func(t *testing.T, ctrl *PersistentVolumeController, reactor *volumeReactor, test timestampTest, currentTime metav1.Time) {
+				obj := ctrl.claims.List()[0]
+				claim := obj.(*v1.PersistentVolumeClaim)
+				reactor.DeleteClaimEvent(claim)
+				reactor.waitForIdle()
+				evaluateLastPhaseTransitionTimeTest(t, ctrl, reactor, test, currentTime)
+			},
+		},
+	}
+	_, ctx := ktesting.NewTestContext(t)
+	runTimestampTests(ctx, t, tests)
 }
